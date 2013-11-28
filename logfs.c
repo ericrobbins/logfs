@@ -3,6 +3,7 @@
  *
  * config file gets reread with a SIGHUP.
  */
+
 #define FUSE_USE_VERSION 26
 
 #include <stdio.h>
@@ -16,9 +17,12 @@
 #include <stdlib.h>
 #include <splitbuf.h>
 #include <netinet/in.h>
+#include <sys/un.h>
 #include <signal.h>
+#include <netdb.h>
 
 #include <readfiles.h>
+#include <debug.h>
 
 struct loglevels {
 	char *label;
@@ -69,8 +73,6 @@ struct logaction {
 	int type;
 	char *target;
 	int fd; // if needed
-	struct sockaddr_in sa; // if needed
-	
 };
 
 struct logfile {
@@ -82,13 +84,6 @@ struct logfile {
 
 static struct logfile *logfiles = NULL;
 static int numlogfiles = 0;
-
-static void
-die(char *err)
-{
-	fprintf(stderr, "%s%s", err, strchr(err, '\n') ? "" : "\n");
-	exit(1);
-}
 
 static int 
 getval(char *label, struct loglevels *ll)
@@ -105,17 +100,17 @@ getval(char *label, struct loglevels *ll)
 }
 
 static void
-free_all_logfiles(struct logfile ***first, int *num)
+free_all_logfiles(struct logfile **first, int *num)
 {
 	int i;
 	for (i = 0; i < *num; i++)
 	{
-		struct logfile *this = (*first)[i];
+		struct logfile *this = &((*first)[i]);
 		free(this->name);
 		int j;
 		for (j = 0; j < this->numactions; j++)
 		{
-			struct logaction *that = this->actions[j];
+			struct logaction *that = &(this->actions)[j];
 			free(that->target);
 			if (that->fd > -1)
 				close(that->fd);
@@ -130,15 +125,114 @@ free_all_logfiles(struct logfile ***first, int *num)
 	return;
 }
 
+int
+open_file(char *name)
+{
+	int fd = open(name, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+	if (fd >= 0)
+		return(fd);
+
+	debug(1, "open(): %s", strerror(errno));
+	return(-1);
+}
+
+int
+get_sock(char *host, int port, int family, int proto)
+{
+	struct sockaddr *soc = malloc(sizeof(struct sockaddr));
+
+	int fd = socket(family, proto, 0);
+	if (family == AF_INET)
+	{
+		struct hostent *hp = gethostbyname(host);
+		struct sockaddr_in *sin = (struct sockaddr_in *)soc;
+		if (fd == -1)
+		{
+			debug(1, "socket(): %s", strerror(errno));
+			return(-1);
+		}
+		if (!hp)
+		{
+			debug(1, "gethostbyname(): %s", hstrerror(h_errno));
+			close(fd);
+			return(-1);
+		}
+	
+		bzero(sin, sizeof(struct sockaddr));
+		sin->sin_port = htons(port);
+		memcpy(&(sin->sin_addr), hp->h_addr, hp->h_length);
+	}
+	else if (family == AF_UNIX)
+	{
+		struct sockaddr_un *sun = (struct sockaddr_un *)soc;
+		sun->sun_family = AF_UNIX;
+		strcpy(sun->sun_path, host);
+	}
+	if (connect(fd, soc, sizeof(struct sockaddr)) == -1)
+	{
+		close(fd);
+		debug(1, "connect(): %s", strerror(errno));
+		return(-1);
+	}
+
+	return(fd);
+}
+
+int
+add_log_action(struct logfile *log, int type, char *val)
+{
+	int fd;
+
+	switch (type) {
+		case ACT_LOCAL:
+			fd = get_sock(val, 0, AF_UNIX, SOCK_DGRAM);
+			break;
+		case ACT_REMOTE:
+			fd = get_sock(val, 514, AF_INET, SOCK_DGRAM);
+			break;
+		case ACT_FILE:
+			fd = open_file(val);
+			break;
+		default:
+			debug(1, "unknown type %i", type);
+			fd = -1;
+			break;
+	}
+	
+	if (fd == -1)
+	{
+		debug(1, "get_sock()/open_file() failed");
+		return(0);
+	}
+
+	struct logaction *t, *this;
+	t = realloc(log->actions, sizeof (struct logaction) * (log->numactions + 1));
+	if (!t)
+	{
+		close(fd);
+		debug(1, "realloc(): %s", strerror(errno));
+		return(0);
+	}
+	log->actions = t;
+	this = &(t[log->numactions]);
+	this->type = type;
+	this->target = malloc(strlen(val) + 1);
+	strcpy(this->target, val);
+	this->fd = fd;
+	log->numactions++;
+		
+	return(1);
+}
+//local
+//file
+
 #define CONFIGFILE "/etc/logfs.conf"
 
 static void
 load_config(int sig)
 {
-	int infile;
 	int inblock = 0;
-	struct stat st;
-	struct logfile **newlogfiles = NULL;
+	struct logfile *newlogfiles = NULL;
 	int numnewlogfiles = 0;
 
 
@@ -146,7 +240,7 @@ load_config(int sig)
 
 	if (!configfile)
 	{
-		debug("could not read config file");
+		debug(0, "could not read config file");
 		goto bailout;
 	}
 
@@ -157,9 +251,7 @@ load_config(int sig)
 	int i;
 	for (i = 0; i < numelements; )
 	{
-		int currentlog = -1;
-
-		printf("%i: %s\n", i, config[i]);
+		debug(2, "%i: %s", i, config[i]);
 		if (inblock)
 		{
 			if (!strcmp(config[i], "loglevel"))
@@ -173,8 +265,8 @@ load_config(int sig)
 					debug(0, "level %s is invalid", config[i + 1]);
 					goto bailout2;
 				}
-				fac = get_val(config[i + 1], facilities);
-				lev = get_val(levstr, levels);
+				fac = getval(config[i + 1], facilities);
+				lev = getval(levstr, levels);
 				if (!fac || !lev)
 				{
 					debug(0, "level %s.%s is invalid", config[i + 1], levstr);
@@ -184,35 +276,42 @@ load_config(int sig)
 			}
 			else if (!strcmp(config[i], "remote"))
 			{
+				if (!add_log_action(&(newlogfiles[numnewlogfiles - 1]), ACT_REMOTE, config[i + 1]))
+					goto bailout2;
 			}
 			else if (!strcmp(config[i], "local"))
 			{
+				if (!add_log_action(&(newlogfiles[numnewlogfiles - 1]), ACT_LOCAL, config[i + 1]))
+					goto bailout2;
 			}
 			else if (!strcmp(config[i], "file"))
 			{
+				if (!add_log_action(&(newlogfiles[numnewlogfiles - 1]), ACT_FILE, config[i + 1]))
+					goto bailout2;
 			}
 			else
 			{
-				debug("unknown keyword in configuration block");
+				debug(0, "unknown keyword in configuration block");
 				goto bailout2;
 			}
+			i += 2;
 		}
 		else
 		{
 			if (!strcmp(config[i], "file"))
 			{
 				struct logfile *this;
-				struct logfile **t = realloc(newlogfiles, (numnewlogfiles + 1) * sizeof(struct logfile));
+				struct logfile *t = realloc(newlogfiles, (numnewlogfiles + 1) * sizeof(struct logfile));
 				if (!t)
 				{
-					debug("realloc() failure");
+					debug(0, "realloc() failure");
 					goto bailout2;
 				}
 				newlogfiles = t;
-				this = newlogfiles[numnewlogfiles];
+				this = &(newlogfiles[numnewlogfiles]);
 				this->name = malloc(strlen(config[i + 1]) + 1);
 				strcpy(this->name, config[i + 1]);
-				this->action = NULL;
+				this->actions = NULL;
 				this->numactions = 0;
 				i += 2;
 				numnewlogfiles++;
@@ -223,7 +322,7 @@ load_config(int sig)
 				inblock--, i++;
 			else
 			{
-				debug("error in configuration file");
+				debug(0, "error in configuration file");
 				goto bailout2;
 			}
 		}
@@ -247,28 +346,16 @@ bailout2:
 	return;
 }
 
-/*
-struct logfile {
-	char *name;
-	int loglevel;
-	struct logaction *action;
-	int numactions;
-};
-
-static struct logfile *logfiles = NULL;
-static int numlogfiles = 0;
-*/
-
 static void
 show_config()
 {
 	int i, j;
 	for (i = 0; i < numlogfiles; i++)
 	{
-		printf("file %s:\n\tloglevel %i\n", logfiles[i].name, logfiles[i].loglevel);
+		debug(2, "file %s:\n\tloglevel %i\n", logfiles[i].name, logfiles[i].loglevel);
 		for (j = 0; j < logfiles[i].numactions; j++)
-			printf("\ttype %i target %s\n", logfiles[i].action[j].type,
-				logfiles[i].action[j].target);
+			debug(2, "\ttype %i target %s\n", logfiles[i].actions[j].type,
+				logfiles[i].actions[j].target);
 	}
 
 	return;
