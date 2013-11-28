@@ -244,6 +244,8 @@ load_config(int sig)
 		goto bailout;
 	}
 
+	debug(2, "configfile:\n%s", configfile);
+
 	char **config;
 	int numelements = splitbuf(SPLITBUF_GROUP|SPLITBUF_STRIPENCLOSE, configfile, " \t\r\n", "\"", &config);
 
@@ -251,7 +253,7 @@ load_config(int sig)
 	int i;
 	for (i = 0; i < numelements; )
 	{
-		debug(2, "%i: %s", i, config[i]);
+		debug(2, "index %i, token %s, inblock %i, numnewlogfiles %i", i, config[i], inblock, numnewlogfiles);
 		if (inblock)
 		{
 			if (!strcmp(config[i], "loglevel"))
@@ -273,33 +275,39 @@ load_config(int sig)
 					goto bailout2;
 				}
 				newlogfiles[numnewlogfiles - 1].loglevel = fac | lev;
+				i += 2;
 			}
 			else if (!strcmp(config[i], "remote"))
 			{
 				if (!add_log_action(&(newlogfiles[numnewlogfiles - 1]), ACT_REMOTE, config[i + 1]))
 					goto bailout2;
+				i += 2;
 			}
 			else if (!strcmp(config[i], "local"))
 			{
 				if (!add_log_action(&(newlogfiles[numnewlogfiles - 1]), ACT_LOCAL, config[i + 1]))
 					goto bailout2;
+				i += 2;
 			}
 			else if (!strcmp(config[i], "file"))
 			{
 				if (!add_log_action(&(newlogfiles[numnewlogfiles - 1]), ACT_FILE, config[i + 1]))
 					goto bailout2;
+				i += 2;
 			}
+			else if (!strcmp(config[i], "}"))
+				inblock--, i++;
 			else
 			{
-				debug(0, "unknown keyword in configuration block");
+				debug(0, "unknown keyword '%s'in configuration block", config[i]);
 				goto bailout2;
 			}
-			i += 2;
 		}
 		else
 		{
 			if (!strcmp(config[i], "file"))
 			{
+debug(2, "adding new file %s", config[i + 1]);
 				struct logfile *this;
 				struct logfile *t = realloc(newlogfiles, (numnewlogfiles + 1) * sizeof(struct logfile));
 				if (!t)
@@ -318,8 +326,6 @@ load_config(int sig)
 			}
 			else if (!strcmp(config[i], "{"))
 				inblock++, i++;
-			else if (!strcmp(config[i], "}"))
-				inblock--, i++;
 			else
 			{
 				debug(0, "error in configuration file");
@@ -442,9 +448,12 @@ static struct fuse_operations logfs_oper = {
 
 int main(int argc, char *argv[])
 {
+	debuglevel = 2;
 	load_config(0);
 	signal(SIGHUP, load_config);
 	show_config();
+	debug(0, "my pid: %i", getpid());
+	sleep(600);
 	exit(0);
 
 	return fuse_main(argc, argv, &logfs_oper, NULL);
