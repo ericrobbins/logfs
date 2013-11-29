@@ -20,9 +20,9 @@ file "blah2.log" {
 
 Future possibilities:
 
-wildcard file names
-file -> twitter
-file -> sendgrid
-file -> twilio (text to speech)
-file -> database row insert?
-file -> all the things
+wildcard file names 
+file -> twitter 
+file -> sendgrid 
+file -> twilio (text to speech) 
+file -> database row insert? 
+file -> all the things 
