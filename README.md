@@ -1,28 +1,33 @@
 logfs
 =====
 
-In the true \*NIX tradition of "everything is a file" ...a FUSE filesystem that syslogs all writes. Written with the FOSS version of NGINX (no syslog) in mind, but would work for anything that writes to a file.
+In the true \*NIX tradition of "everything is a file" ...a FUSE filesystem that syslogs all writes. Written with the FOSS version of NGINX (no syslog) in mind, but would work for anything that writes to a file. 
 
-Configuration:
-/etc/logfs.conf
-file "blah.log" {
-	facility LOG_DAEMON
-	level LOG_INFO
-	remote 10.100.101.101
-	file /var/log/blah.log
-	local /dev/log # this writes to /dev/log
-}
+You will need my [utilities](https://github.com/ericrobbins/utilities) repo as well. It does most of the string handling for parsing the configuration file.
 
-file "blah2.log" {
-	...
-}
+Configuration is in /etc/logfs.conf:
+
+	// comments can be // or #, but not /* */
+	file "blah.log" {
+		loglevel daemon.info   ## any valid facility.level pair works here.. like syslog.conf
+		remote 10.100.101.101  ## logs to a remote syslog server, port 514, UDP only for now
+		file /var/log/blah.log ## local regular file 
+		local /dev/log         ## this writes to /dev/log socket
+	}
+
+	file "blah2.log" {
+		## some options go here
+	}
 
 
-Future possibilities:
+I run it as logfs -o allow_other /mountpoint so that daemons run as non root users can log. I have tested with valgrind, and generated spammy log messages to test, and believe I have caught any leaks. There is MUCH tightening up to be done, there are many places I do not properly check return codes. I thought it best to get something up and working first, and clean up later. I would say this is not production ready at all but it should not be too difficult to make so.
 
-wildcard file names 
-file -> twitter 
-file -> sendgrid 
-file -> twilio (text to speech) 
-file -> database row insert? 
-file -> all the things 
+------
+Future possibilities:   
+
+wildcard file names    
+file -> twitter     
+file -> sendgrid    
+file -> twilio (text to speech)     
+file -> database row insert?    
+file -> all the things    
