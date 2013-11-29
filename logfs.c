@@ -118,8 +118,12 @@ free_all_logfiles(struct logfile **first, int *num)
 			free(that->target);
 			if (that->fd > -1)
 				close(that->fd);
+			if (that->outbuf)
+				free(that->outbuf);
 		}
 		free(this->actions);
+		if (this->inbuf)
+			free(this->inbuf);
 	}
 
 	free(*first);
@@ -127,6 +131,19 @@ free_all_logfiles(struct logfile **first, int *num)
 	*num = 0;
 
 	return;
+}
+
+static int
+lookup_action(char *target, struct logfile *lf)
+{
+	int i;
+	for (i = 0; i < lf->numactions; i++)
+	{
+		if (!strcmp(lf->actions[i].target, target))
+			return(i);
+	}
+
+	return(-1);
 }
 
 // call with full = true when path from fuse (/filename not filename)
@@ -354,6 +371,28 @@ debug(2, "adding new file %s", config[i + 1]);
 			{
 				debug(0, "error in configuration file");
 				goto bailout2;
+			}
+		}
+	}
+
+	int j;
+	for (j = 0; j < numnewlogfiles; j++)
+	{
+		int k = lookup_file(newlogfiles[j].name, 0);
+		if (k == -1)
+			continue;
+		newlogfiles[j].inbuf = logfiles[k].inbuf;
+		logfiles[k].inbuf = NULL;
+		newlogfiles[j].inbuflen = logfiles[k].inbuflen;
+		int m;
+		for (m = 0; m < newlogfiles[j].numactions; m++)
+		{
+			int n = lookup_action(newlogfiles[j].actions[m].target, &(logfiles[k]));
+			if (n != -1)
+			{
+				newlogfiles[j].actions[m].outbuf = logfiles[k].actions[n].outbuf;
+				logfiles[k].actions[n].outbuf = NULL;
+				newlogfiles[j].actions[m].outbuflen = logfiles[k].actions[n].outbuflen;
 			}
 		}
 	}
