@@ -20,6 +20,7 @@
 #include <sys/un.h>
 #include <signal.h>
 #include <netdb.h>
+#include <pthread.h>
 
 #include <readfiles.h>
 #include <debug.h>
@@ -84,10 +85,13 @@ struct logfile {
 	int numactions;
 	char *inbuf;
 	int inbuflen;
+	pthread_mutex_t alock;
 };
 
 static struct logfile *logfiles = NULL;
 static int numlogfiles = 0;
+
+static volatile int loading_config = 0;
 
 static int 
 getval(char *label, struct loglevels *ll)
@@ -122,6 +126,7 @@ free_all_logfiles(struct logfile **first, int *num)
 				free(that->outbuf);
 		}
 		free(this->actions);
+		pthread_mutex_destroy(&(this->alock));
 		if (this->inbuf)
 			free(this->inbuf);
 	}
@@ -274,6 +279,7 @@ load_config(int sig)
 	struct logfile *newlogfiles = NULL;
 	int numnewlogfiles = 0;
 
+	loading_config = 1;
 
 	char *configfile = readwholefile(CONFIGFILE, READFILES_ALL);
 
@@ -362,6 +368,7 @@ debug(2, "adding new file %s", config[i + 1]);
 				this->numactions = 0;
 				this->inbuf = NULL;
 				this->inbuflen = 0;
+				pthread_mutex_init(&(this->alock), NULL);
 				i += 2;
 				numnewlogfiles++;
 			}
@@ -369,7 +376,7 @@ debug(2, "adding new file %s", config[i + 1]);
 				inblock++, i++;
 			else
 			{
-				debug(0, "error in configuration file");
+				debug(0, "unknown keyword '%s'in configuration block", config[i]);
 				goto bailout2;
 			}
 		}
@@ -405,6 +412,7 @@ bailout:
 		free(config);
 	if (configfile)
 		free(configfile);
+	loading_config = 1;
 	return;
 
 bailout2:
@@ -412,6 +420,7 @@ bailout2:
 		free_all_logfiles(&newlogfiles, &numnewlogfiles);
 	free(config);
 	free(configfile);
+	loading_config = 1;
 	return;
 }
 
@@ -430,10 +439,182 @@ show_config()
 	return;
 }
 
+void
+write_all(struct logaction *one)
+{
+	int rval = write(one->fd, one->outbuf, one->outbuflen);
+	if (rval == -1)
+	{
+		debug(1, "write() error: %s", strerror(errno));
+		return;
+	}
+
+	one->outbuflen -= rval;
+	if (one->outbuflen <= 0)
+	{
+		if (one->outbuflen < 0)
+			debug(0, "outbuflen is less than 0!? %i", one->outbuflen);
+		free(one->outbuf);
+		one->outbuf = NULL;
+	}
+	else
+	{
+		memcpy(one->outbuf, one->outbuf + rval, one->outbuflen);
+		//char *x = realloc(one->outbuf, one->outbuflen);
+	}
+		
+	return;
+}
+
+void
+send_lines(struct logaction *one)
+{
+	char last = one->outbuf[one->outbuflen - 1];
+	one->outbuf[one->outbuflen - 1] = '\0'; // I'm not null terminating the buffer.. so a little hack
+
+	char *tmp;
+	char *buf = one->outbuf;
+
+	while (buf && ((tmp = strchr(buf, '\n')) != NULL || last == '\n'))
+	{
+		if (tmp)
+			*tmp++ = '\0';
+		int thislen = strlen(buf);
+		int rval = send(one->fd, buf, thislen, 0);
+		if (rval != thislen)
+		{
+			debug(0, "send() had a problem: %s", strerror(errno));
+			break;
+		}
+		buf = tmp;
+	}
+
+	if (buf)
+	{
+		int newlen = strlen(buf) + 1;
+		one->outbuf[one->outbuflen - 1] = last;
+		memcpy(one->outbuf, buf, newlen);
+		one->outbuflen = newlen;
+	}
+	else
+	{
+		free(one->outbuf);
+		one->outbuflen = 0;
+	}
+	
+	return;
+}
+
+static void 
+do_writes(struct logaction *list, int num)
+{
+	int i;
+
+	for (i = 0; i < num; i++)
+	{
+		if (list[i].outbuflen == 0)
+			continue;
+
+		switch (list[i].type) {
+			case ACT_REMOTE:
+			case ACT_LOCAL:
+				send_lines(&(list[i]));
+				break;
+			case ACT_FILE:
+				write_all(&(list[i]));
+				break;
+			default:
+				break;
+		}
+	}
+	
+	return;
+}
+
+static void *
+flush_writes(void *arg)
+{
+//ACT_LOCAL remote file
+	while (1)
+	{
+		int i;
+startover:
+		for (i = 0; i < numlogfiles; i++)
+		{
+			if (loading_config == 1)
+			{
+				usleep(10000);
+				goto startover; // this will just spin until config load is done
+			}
+			pthread_mutex_lock(&(logfiles[i].alock));
+			char *buf = NULL;
+			int buflen = 0;
+			if (logfiles[i].inbuf)
+			{
+				buf = logfiles[i].inbuf;
+				buflen = logfiles[i].inbuflen;
+				logfiles[i].inbuf = NULL;
+				logfiles[i].inbuflen = 0;
+			}
+			pthread_mutex_unlock(&(logfiles[i].alock));
+
+			int j;
+			for (j = 0; j < logfiles[i].numactions; j++)
+			{
+				struct logaction *la = &(logfiles[i].actions[j]);
+				char *z;
+				if (la->outbuflen > 0)
+					z = realloc(la->outbuf, la->outbuflen + buflen);
+				else
+					z = malloc(buflen);
+
+				if (!z)
+				{
+					debug(0, "(re/m)alloc() failed in flush thread! %s", strerror(errno));
+				}
+				else
+				{
+					memcpy(z + la->outbuflen, buf, buflen);
+					la->outbuf = z;
+					la->outbuflen += buflen;
+				}
+			}
+
+			do_writes(logfiles[i].actions, logfiles[i].numactions);
+		}
+	}
+
+	return(NULL);
+}
+
+/* this isn't optimal, since I'm keeping a copy of the buffer for each outfile.. but 
+   if some outputs block/have errors and some don't, there's no great way to handle it.. 
+*/
+
 static void
 handle_write(int fileno, char *buf, int size)
 {	
-	debug(2, "handle_write() called on file %s with size %i", logfiles[fileno].name, size);
+	struct logfile *p = &(logfiles[fileno]);
+
+	pthread_mutex_lock(&(p->alock));
+	debug(2, "handle_write() called on file %s with size %i", p->name, size);
+	char *x;
+	if (p->inbuflen > 0)
+		x = realloc(p->inbuf, p->inbuflen + size);
+	else
+		x = malloc(size);
+
+	if (!x)
+	{
+		debug(0, "(re/m)alloc() failed in handle_write! %s", strerror(errno));
+		pthread_mutex_unlock(&(p->alock));
+		return;
+	}
+	memcpy(x + p->inbuflen, buf, size);
+	p->inbuf = x;
+	p->inbuflen += size;
+	pthread_mutex_unlock(&(p->alock));
+	
 	return;
 }
 
@@ -582,9 +763,15 @@ static struct fuse_operations logfs_oper = {
 	.fsyncdir	= logfs_fsyncdir,
 };
 
+static pthread_t flushthread;
+static pthread_mutex_t flushlock;
+
 int main(int argc, char *argv[])
 {
 	debuglevel = 2;
+	pthread_mutex_init(&flushlock, NULL);
+	pthread_create(&flushthread, NULL, flush_writes, NULL);
+	pthread_detach(flushthread);
 	load_config(0);
 	signal(SIGUSR1, load_config);
 	show_config();
