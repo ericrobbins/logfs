@@ -72,7 +72,9 @@ static struct loglevels facilities[] = {
 struct logaction {
 	int type;
 	char *target;
-	int fd; // if needed
+	int fd;
+	char *outbuf;
+	int outbuflen;
 };
 
 struct logfile {
@@ -80,6 +82,8 @@ struct logfile {
 	int loglevel;
 	struct logaction *actions;
 	int numactions;
+	char *inbuf;
+	int inbuflen;
 };
 
 static struct logfile *logfiles = NULL;
@@ -125,7 +129,22 @@ free_all_logfiles(struct logfile **first, int *num)
 	return;
 }
 
-int
+// call with full = true when path from fuse (/filename not filename)
+static int
+lookup_file(const char *name, int full)
+{
+	int i = numlogfiles;
+
+	while (i-- > 0)
+	{
+		if (!strcmp(name + (full ? 1 : 0), logfiles[i].name))
+			return(i);
+	}
+
+	return -1;
+}
+
+static int
 open_file(char *name)
 {
 	int fd = open(name, O_WRONLY|O_CREAT|O_TRUNC, 0644);
@@ -136,7 +155,7 @@ open_file(char *name)
 	return(-1);
 }
 
-int
+static int
 get_sock(char *host, int port, int family, int proto)
 {
 	struct sockaddr *soc = malloc(sizeof(struct sockaddr));
@@ -174,11 +193,14 @@ get_sock(char *host, int port, int family, int proto)
 		debug(1, "connect(): %s", strerror(errno));
 		return(-1);
 	}
+	// set non blocking
+	int flags = fcntl(fd, F_GETFL, 0);
+	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
 	return(fd);
 }
 
-int
+static int
 add_log_action(struct logfile *log, int type, char *val)
 {
 	int fd;
@@ -219,12 +241,12 @@ add_log_action(struct logfile *log, int type, char *val)
 	this->target = malloc(strlen(val) + 1);
 	strcpy(this->target, val);
 	this->fd = fd;
+	this->outbuf = NULL;
+	this->outbuflen = 0;
 	log->numactions++;
 		
 	return(1);
 }
-//local
-//file
 
 #define CONFIGFILE "/etc/logfs.conf"
 
@@ -321,6 +343,8 @@ debug(2, "adding new file %s", config[i + 1]);
 				strcpy(this->name, config[i + 1]);
 				this->actions = NULL;
 				this->numactions = 0;
+				this->inbuf = NULL;
+				this->inbuflen = 0;
 				i += 2;
 				numnewlogfiles++;
 			}
@@ -367,6 +391,13 @@ show_config()
 	return;
 }
 
+static void
+handle_write(int fileno, char *buf, int size)
+{	
+	debug(2, "handle_write() called on file %s with size %i", logfiles[fileno].name, size);
+	return;
+}
+
 static int 
 logfs_getattr(const char *path, struct stat *st)
 {
@@ -382,22 +413,17 @@ logfs_getattr(const char *path, struct stat *st)
 	}
 
 	/* check list of opened log files, set appropriate stat fields */
-	int i;
-	for (i = 0; i < numlogfiles; i++)
-	{
-		if (!strcmp(path, logfiles[i].name))
-		{
-			st->st_mode = S_IFREG | 0222;
-			st->st_nlink = 1;
-			return res;
-		}
-	}
+	int i = lookup_file(path, 1);
+	if (i == -1)
+		return -ENOENT;
 
-	// not /, and not a file we have open 
-	return -ENOENT;
+	st->st_mode = S_IFREG | 0222;
+	st->st_nlink = 1;
+	return res;
 }
 
-static int logfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+static int 
+logfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 			 off_t offset, struct fuse_file_info *fi)
 {
 	(void) offset;
@@ -409,7 +435,9 @@ static int logfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
 	filler(buf, ".", NULL, 0);
 	filler(buf, "..", NULL, 0);
-	filler(buf, "hello", NULL, 0);
+	int i;
+	for (i = 0; i < numlogfiles; i++)
+		filler(buf, logfiles[i].name, NULL, 0);
 
 	return 0;
 }
@@ -418,6 +446,8 @@ static int
 logfs_open(const char *path, struct fuse_file_info *fi)
 {
 	// must open for write.. don't care about other modes (TRUNC, READ, etc)
+	// I dont really care about the result of this, as I am perfectly happy 
+	// writing to a file that isn't open for this application... so I'm not keeping track.
 	if (! (fi->flags & O_WRONLY))
 		return -EACCES;
 
@@ -434,7 +464,67 @@ logfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_f
 static int 
 logfs_write(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-	// we are write only..
+	int fileno = lookup_file(path, 1);
+	if (fileno == -1)
+		return -EINVAL;
+
+	handle_write(fileno, buf, size);
+	return size;
+}
+
+static int 
+logfs_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi) 
+{ 
+	if (lookup_file(path, 1) != -1)
+		return 0; 
+	return -EACCES;
+}
+
+static int 
+logfs_truncate(const char *path, off_t newsize)
+{ 
+	if (lookup_file(path, 1) != -1)
+		return 0; 
+	return -EACCES;
+}
+
+static int 
+logfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+{ 
+	if (lookup_file(path, 1) != -1)
+		return 0; 
+	return -EACCES;
+}
+
+static int 
+logfs_mknod(const char *path, mode_t mode, dev_t dev)
+{ 
+	if (lookup_file(path, 1) != -1)
+		return 0; 
+	return -EACCES;
+}
+
+static int 
+logfs_flush(const char *path, struct fuse_file_info *fi)
+{ 
+	if (lookup_file(path, 1) != -1)
+		return 0; 
+	return -EACCES;
+}
+
+static int 
+logfs_fsync(const char *path, int datasync, struct fuse_file_info *fi)
+{ 
+	if (lookup_file(path, 1) != -1)
+		return 0; 
+	return -EINVAL;
+}
+
+static int 
+logfs_fsyncdir(const char *path, int datasync, struct fuse_file_info *fi)
+{ 
+	if (lookup_file(path, 1) != -1)
+		return 0; 
 	return -EINVAL;
 }
 
@@ -444,17 +534,24 @@ static struct fuse_operations logfs_oper = {
 	.open		= logfs_open,
 	.read		= logfs_read,
 	.write		= logfs_write,
+	.truncate	= logfs_truncate,
+	.ftruncate	= logfs_ftruncate,
+	.create		= logfs_create,
+	.mknod		= logfs_mknod,
+	.flush		= logfs_flush,
+	.fsync		= logfs_fsync,
+	.fsyncdir	= logfs_fsyncdir,
 };
 
 int main(int argc, char *argv[])
 {
 	debuglevel = 2;
 	load_config(0);
-	signal(SIGHUP, load_config);
+	signal(SIGUSR1, load_config);
 	show_config();
 	debug(0, "my pid: %i", getpid());
-	sleep(600);
-	exit(0);
+	//sleep(600);
+	//exit(0);
 
 	return fuse_main(argc, argv, &logfs_oper, NULL);
 }
