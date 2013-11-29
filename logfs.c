@@ -25,6 +25,8 @@
 #include <readfiles.h>
 #include <debug.h>
 
+#define CONFIGFILE "/etc/logfs.conf"
+
 struct loglevels {
 	char *label;
 	int level;
@@ -44,7 +46,7 @@ static struct loglevels levels[] = {
 
 static struct loglevels facilities[] = {
 	{ "auth", 	LOG_AUTH },
-	{ "autpriv",	LOG_AUTHPRIV },
+	{ "authpriv",	LOG_AUTHPRIV },
 	{ "cron",	LOG_CRON },
 	{ "daemon",	LOG_DAEMON },
 	{ "ftp",	LOG_FTP },
@@ -174,7 +176,7 @@ lookup_file(const char *name, int full)
 static int
 open_file(char *name)
 {
-	int fd = open(name, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+	int fd = open(name, O_WRONLY|O_CREAT|O_NONBLOCK, 0644);
 	if (fd >= 0)
 		return(fd);
 
@@ -233,7 +235,7 @@ get_sock(char *host, int port, int family, int proto)
 }
 
 static int
-add_log_action(struct logfile *log, int type, char *val)
+open_fd(int type, char *val)
 {
 	int fd;
 
@@ -252,12 +254,18 @@ add_log_action(struct logfile *log, int type, char *val)
 			fd = -1;
 			break;
 	}
-	
+
+	return(fd);
+}
+
+static int
+add_log_action(struct logfile *log, int type, char *val)
+{
+	int fd;
+
+	fd = open_fd(type, val);
 	if (fd == -1)
-	{
-		debug(1, "get_sock()/open_file() failed");
-		return(0);
-	}
+		debug(1, "open_fd() failed");
 
 	struct logaction *t, *this;
 	t = realloc(log->actions, sizeof (struct logaction) * (log->numactions + 1));
@@ -279,8 +287,6 @@ add_log_action(struct logfile *log, int type, char *val)
 		
 	return(1);
 }
-
-#define CONFIGFILE "/etc/logfs.conf"
 
 static void
 load_config(int sig)
@@ -459,6 +465,9 @@ show_config()
 void
 write_all(struct logaction *one)
 {
+	if (one->fd == -1)
+		one->fd = open_fd(one->type, one->target);
+
 	int rval = write(one->fd, one->outbuf, one->outbuflen);
 	if (rval == -1)
 	{
@@ -502,6 +511,8 @@ send_lines(struct logaction *one, int level, char *label)
 		char *logstr = malloc(thislen + strlen(label ? label : "logfs") + 7);
 		sprintf(logstr, "<%i>%s: %s", level, label ? label : "logfs", buf);
 		int sendlen = strlen(logstr);
+		if (one->fd == -1)
+			one->fd = open_fd(one->type, one->target);
 		int rval = send(one->fd, logstr, sendlen, 0);
 		if (rval != sendlen)
 		{
