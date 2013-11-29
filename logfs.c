@@ -80,6 +80,7 @@ struct logaction {
 
 struct logfile {
 	char *name;
+	char *label;
 	int loglevel;
 	struct logaction *actions;
 	int numactions;
@@ -114,7 +115,8 @@ free_all_logfiles(struct logfile **first, int *num)
 	for (i = 0; i < *num; i++)
 	{
 		struct logfile *this = &((*first)[i]);
-		free(this->name);
+		if (this->name)
+			free(this->name);
 		int j;
 		for (j = 0; j < this->numactions; j++)
 		{
@@ -125,7 +127,10 @@ free_all_logfiles(struct logfile **first, int *num)
 			if (that->outbuf)
 				free(that->outbuf);
 		}
-		free(this->actions);
+		if (this->actions)
+			free(this->actions);
+		if (this->label)
+			free(this->label);
 		pthread_mutex_destroy(&(this->alock));
 		if (this->inbuf)
 			free(this->inbuf);
@@ -190,11 +195,13 @@ get_sock(char *host, int port, int family, int proto)
 		if (fd == -1)
 		{
 			debug(1, "socket(): %s", strerror(errno));
+			free(soc);
 			return(-1);
 		}
 		if (!hp)
 		{
 			debug(1, "gethostbyname(): %s", hstrerror(h_errno));
+			free(soc);
 			close(fd);
 			return(-1);
 		}
@@ -213,12 +220,14 @@ get_sock(char *host, int port, int family, int proto)
 	if (connect(fd, soc, sizeof(struct sockaddr)) == -1)
 	{
 		close(fd);
+		free(soc);
 		debug(1, "connect(): %s", strerror(errno));
 		return(-1);
 	}
 	// set non blocking
 	int flags = fcntl(fd, F_GETFL, 0);
 	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	free(soc);
 
 	return(fd);
 }
@@ -323,6 +332,12 @@ load_config(int sig)
 				newlogfiles[numnewlogfiles - 1].loglevel = fac | lev;
 				i += 2;
 			}
+			else if (!strcmp(config[i], "label"))
+			{
+				newlogfiles[numnewlogfiles - 1].label = malloc(strlen(config[i + 1]) + 1);
+				strcpy(newlogfiles[numnewlogfiles - 1].label, config[i + 1]);
+				i += 2;
+			}
 			else if (!strcmp(config[i], "remote"))
 			{
 				if (!add_log_action(&(newlogfiles[numnewlogfiles - 1]), ACT_REMOTE, config[i + 1]))
@@ -366,6 +381,7 @@ debug(2, "adding new file %s", config[i + 1]);
 				this->name = malloc(strlen(config[i + 1]) + 1);
 				strcpy(this->name, config[i + 1]);
 				this->actions = NULL;
+				this->label = NULL;
 				this->numactions = 0;
 				this->inbuf = NULL;
 				this->inbuflen = 0;
@@ -457,6 +473,7 @@ write_all(struct logaction *one)
 			debug(0, "outbuflen is less than 0!? %i", one->outbuflen);
 		free(one->outbuf);
 		one->outbuf = NULL;
+		one->outbuflen = 0;
 	}
 	else
 	{
@@ -468,7 +485,7 @@ write_all(struct logaction *one)
 }
 
 void
-send_lines(struct logaction *one, int level)
+send_lines(struct logaction *one, int level, char *label)
 {
 	char last = one->outbuf[one->outbuflen - 1];
 	one->outbuf[one->outbuflen - 1] = '\0'; // I'm not null terminating the buffer.. so a little hack
@@ -481,8 +498,9 @@ send_lines(struct logaction *one, int level)
 		if (tmp)
 			*tmp++ = '\0';
 		int thislen = strlen(buf);
-		char *logstr = malloc(thislen + 10);
-		sprintf(logstr, "<%i>%s", level, buf);
+		/* +7 ==  <NN>: \0 */
+		char *logstr = malloc(thislen + strlen(label ? label : "logfs") + 7);
+		sprintf(logstr, "<%i>%s: %s", level, label ? label : "logfs", buf);
 		int sendlen = strlen(logstr);
 		int rval = send(one->fd, logstr, sendlen, 0);
 		if (rval != sendlen)
@@ -511,7 +529,7 @@ send_lines(struct logaction *one, int level)
 }
 
 static void 
-do_writes(struct logaction *list, int num, int level)
+do_writes(struct logaction *list, int num, int level, char *label)
 {
 	int i;
 
@@ -525,7 +543,7 @@ do_writes(struct logaction *list, int num, int level)
 		switch (list[i].type) {
 			case ACT_REMOTE:
 			case ACT_LOCAL:
-				send_lines(&(list[i]), level);
+				send_lines(&(list[i]), level, label);
 				break;
 			case ACT_FILE:
 				write_all(&(list[i]));
@@ -573,7 +591,11 @@ startover:
 				goto startover; // this will just spin until config load is done
 			}
 
-			if (buflen)
+/* this isn't optimal, since I'm keeping a copy of the buffer for each file route.. but 
+   if some outputs block/have errors and some don't, there's no easy way to handle it 
+   if I only have 1 buffer
+*/
+			if (buflen && buf)
 			{
 				int j;
 				for (j = 0; j < logfiles[i].numactions; j++)
@@ -595,15 +617,16 @@ startover:
 						la->outbuf = z;
 						la->outbuflen += buflen;
 					}
-					if (loading_config == 1)
-					{
-						usleep(10000);
-						goto startover; // this will just spin until config load is done
-					}
+				}
+				free(buf);
+				if (loading_config == 1)
+				{
+					usleep(10000);
+					goto startover; // this will just spin until config load is done
 				}
 			}
 
-			do_writes(logfiles[i].actions, logfiles[i].numactions, logfiles[i].loglevel);
+			do_writes(logfiles[i].actions, logfiles[i].numactions, logfiles[i].loglevel, logfiles[i].label);
 		}
 		usleep(10000);
 	}
@@ -611,12 +634,8 @@ startover:
 	return(NULL);
 }
 
-/* this isn't optimal, since I'm keeping a copy of the buffer for each outfile.. but 
-   if some outputs block/have errors and some don't, there's no great way to handle it.. 
-*/
-
 static void
-handle_write(int fileno, char *buf, int size)
+handle_write(int fileno, const char *buf, int size)
 {	
 	struct logfile *p = &(logfiles[fileno]);
 
@@ -706,7 +725,7 @@ logfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_f
 }
 
 static int 
-logfs_write(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+logfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
 	int fileno = lookup_file(path, 1);
 	if (fileno == -1)
@@ -776,7 +795,7 @@ static struct fuse_operations logfs_oper = {
 	.getattr	= logfs_getattr,
 	.readdir	= logfs_readdir,
 	.open		= logfs_open,
-	.read		= logfs_read,
+	.read		= logfs_read, 
 	.write		= logfs_write,
 	.truncate	= logfs_truncate,
 	.ftruncate	= logfs_ftruncate,
