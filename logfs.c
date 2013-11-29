@@ -200,13 +200,14 @@ get_sock(char *host, int port, int family, int proto)
 		}
 	
 		bzero(sin, sizeof(struct sockaddr));
+		sin->sin_family = family;
 		sin->sin_port = htons(port);
 		memcpy(&(sin->sin_addr), hp->h_addr, hp->h_length);
 	}
 	else if (family == AF_UNIX)
 	{
 		struct sockaddr_un *sun = (struct sockaddr_un *)soc;
-		sun->sun_family = AF_UNIX;
+		sun->sun_family = family;
 		strcpy(sun->sun_path, host);
 	}
 	if (connect(fd, soc, sizeof(struct sockaddr)) == -1)
@@ -412,7 +413,7 @@ bailout:
 		free(config);
 	if (configfile)
 		free(configfile);
-	loading_config = 1;
+	loading_config = 0;
 	return;
 
 bailout2:
@@ -420,7 +421,7 @@ bailout2:
 		free_all_logfiles(&newlogfiles, &numnewlogfiles);
 	free(config);
 	free(configfile);
-	loading_config = 1;
+	loading_config = 0;
 	return;
 }
 
@@ -467,7 +468,7 @@ write_all(struct logaction *one)
 }
 
 void
-send_lines(struct logaction *one)
+send_lines(struct logaction *one, int level)
 {
 	char last = one->outbuf[one->outbuflen - 1];
 	one->outbuf[one->outbuflen - 1] = '\0'; // I'm not null terminating the buffer.. so a little hack
@@ -480,12 +481,16 @@ send_lines(struct logaction *one)
 		if (tmp)
 			*tmp++ = '\0';
 		int thislen = strlen(buf);
-		int rval = send(one->fd, buf, thislen, 0);
-		if (rval != thislen)
+		char *logstr = malloc(thislen + 10);
+		sprintf(logstr, "<%i>%s", level, buf);
+		int sendlen = strlen(logstr);
+		int rval = send(one->fd, logstr, sendlen, 0);
+		if (rval != sendlen)
 		{
 			debug(0, "send() had a problem: %s", strerror(errno));
 			break;
 		}
+		free(logstr);
 		buf = tmp;
 	}
 
@@ -506,9 +511,11 @@ send_lines(struct logaction *one)
 }
 
 static void 
-do_writes(struct logaction *list, int num)
+do_writes(struct logaction *list, int num, int level)
 {
 	int i;
+
+	//debug(2, "entering do_writes()");
 
 	for (i = 0; i < num; i++)
 	{
@@ -518,7 +525,7 @@ do_writes(struct logaction *list, int num)
 		switch (list[i].type) {
 			case ACT_REMOTE:
 			case ACT_LOCAL:
-				send_lines(&(list[i]));
+				send_lines(&(list[i]), level);
 				break;
 			case ACT_FILE:
 				write_all(&(list[i]));
@@ -534,11 +541,12 @@ do_writes(struct logaction *list, int num)
 static void *
 flush_writes(void *arg)
 {
-//ACT_LOCAL remote file
+	//debug(2, "entering flush_writes(), numlogfiles %i", numlogfiles);
 	while (1)
 	{
 		int i;
 startover:
+		//debug(2, "looping flush_writes(), numlogfiles %i", numlogfiles);
 		for (i = 0; i < numlogfiles; i++)
 		{
 			if (loading_config == 1)
@@ -546,6 +554,7 @@ startover:
 				usleep(10000);
 				goto startover; // this will just spin until config load is done
 			}
+			//debug(2, "passed loading_config check");
 			pthread_mutex_lock(&(logfiles[i].alock));
 			char *buf = NULL;
 			int buflen = 0;
@@ -558,30 +567,45 @@ startover:
 			}
 			pthread_mutex_unlock(&(logfiles[i].alock));
 
-			int j;
-			for (j = 0; j < logfiles[i].numactions; j++)
+			if (loading_config == 1)
 			{
-				struct logaction *la = &(logfiles[i].actions[j]);
-				char *z;
-				if (la->outbuflen > 0)
-					z = realloc(la->outbuf, la->outbuflen + buflen);
-				else
-					z = malloc(buflen);
+				usleep(10000);
+				goto startover; // this will just spin until config load is done
+			}
 
-				if (!z)
+			if (buflen)
+			{
+				int j;
+				for (j = 0; j < logfiles[i].numactions; j++)
 				{
-					debug(0, "(re/m)alloc() failed in flush thread! %s", strerror(errno));
-				}
-				else
-				{
-					memcpy(z + la->outbuflen, buf, buflen);
-					la->outbuf = z;
-					la->outbuflen += buflen;
+					struct logaction *la = &(logfiles[i].actions[j]);
+					char *z;
+					if (la->outbuflen > 0)
+						z = realloc(la->outbuf, la->outbuflen + buflen);
+					else
+						z = malloc(buflen);
+	
+					if (!z)
+					{
+						debug(0, "(re/m)alloc() failed in flush thread! %s", strerror(errno));
+					}
+					else
+					{
+						memcpy(z + la->outbuflen, buf, buflen);
+						la->outbuf = z;
+						la->outbuflen += buflen;
+					}
+					if (loading_config == 1)
+					{
+						usleep(10000);
+						goto startover; // this will just spin until config load is done
+					}
 				}
 			}
 
-			do_writes(logfiles[i].actions, logfiles[i].numactions);
+			do_writes(logfiles[i].actions, logfiles[i].numactions, logfiles[i].loglevel);
 		}
+		usleep(10000);
 	}
 
 	return(NULL);
@@ -769,10 +793,12 @@ static pthread_mutex_t flushlock;
 int main(int argc, char *argv[])
 {
 	debuglevel = 2;
-	pthread_mutex_init(&flushlock, NULL);
-	pthread_create(&flushthread, NULL, flush_writes, NULL);
-	pthread_detach(flushthread);
 	load_config(0);
+	pthread_mutex_init(&flushlock, NULL);
+	int rval = pthread_create(&flushthread, NULL, flush_writes, NULL);
+	if (rval == -1)
+		debug(0, "pthread_create() failed: %s", strerror(errno));
+	//pthread_detach(flushthread);
 	signal(SIGUSR1, load_config);
 	show_config();
 	debug(0, "my pid: %i", getpid());
