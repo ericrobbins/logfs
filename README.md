@@ -3,7 +3,8 @@ logfs
 
 In the true \*NIX tradition of "everything is a file" ...a FUSE filesystem that syslogs (or writes to a real file) all writes to configured file names. Written with the FOSS version of NGINX (no syslog) in mind, but would work for anything that writes logs out to a file. 
 
-You will need my [utilities](https://github.com/ericrobbins/utilities) repo as well. It does most of the string handling for parsing the configuration file.
+
+You will need: gcc, FUSE, and my [utilities](https://github.com/ericrobbins/utilities) repo. It does most of the string handling for parsing the configuration file.
 
 Configuration is in /etc/logfs.conf:
 
