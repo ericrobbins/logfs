@@ -176,7 +176,7 @@ lookup_file(const char *name, int full)
 static int
 open_file(char *name)
 {
-	int fd = open(name, O_WRONLY|O_CREAT|O_NONBLOCK, 0644);
+	int fd = open(name, O_WRONLY|O_CREAT|O_NONBLOCK|O_APPEND, 0644);
 	if (fd >= 0)
 		return(fd);
 
@@ -533,6 +533,7 @@ send_lines(struct logaction *one, int level, char *label)
 	else
 	{
 		free(one->outbuf);
+		one->outbuf = NULL;
 		one->outbuflen = 0;
 	}
 	
