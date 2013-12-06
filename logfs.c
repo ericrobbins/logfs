@@ -486,7 +486,7 @@ write_all(struct logaction *one)
 	}
 	else
 	{
-		memcpy(one->outbuf, one->outbuf + rval, one->outbuflen);
+		memmove(one->outbuf, one->outbuf + rval, one->outbuflen);
 		//char *x = realloc(one->outbuf, one->outbuflen);
 	}
 		
@@ -527,7 +527,7 @@ send_lines(struct logaction *one, int level, char *label)
 	{
 		int newlen = strlen(buf) + 1;
 		one->outbuf[one->outbuflen - 1] = last;
-		memcpy(one->outbuf, buf, newlen);
+		memmove(one->outbuf, buf, newlen);
 		one->outbuflen = newlen;
 	}
 	else
@@ -625,7 +625,7 @@ startover:
 					}
 					else
 					{
-						memcpy(z + la->outbuflen, buf, buflen);
+						memmove(z + la->outbuflen, buf, buflen);
 						la->outbuf = z;
 						la->outbuflen += buflen;
 					}

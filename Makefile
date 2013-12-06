@@ -12,5 +12,8 @@ logfs: logfs.o
 clean:
 	rm -f *.o $(OUTFILES)
 
+install:
+	cp $(OUTFILES) /usr/local/bin/
+
 .c.o:
 	gcc -c $(CFLAGS) $<
