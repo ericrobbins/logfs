@@ -297,7 +297,7 @@ load_config(int sig)
 
 	loading_config = 1;
 
-	char *configfile = readwholefile(CONFIGFILE, READFILES_ALL);
+	char *configfile = readwholefile(CONFIGFILE, NULL, READFILES_ALL);
 
 	if (!configfile)
 	{
@@ -308,7 +308,7 @@ load_config(int sig)
 	debug(2, "configfile:\n%s", configfile);
 
 	char **config;
-	int numelements = splitbuf(SPLITBUF_GROUP|SPLITBUF_STRIPENCLOSE, configfile, " \t\r\n", "\"", &config);
+	int numelements = splitbuf(SPLITBUF_GROUP|SPLITBUF_STRIPENCLOSE, configfile, " \t\r\n", "\"", 0, &config);
 
 // file "blah.log" { loglevel daemon.info remote 10.100.101.101 file /var/log/blah.log local /dev/log }
 	int i;
@@ -823,7 +823,7 @@ static pthread_mutex_t flushlock;
 
 int main(int argc, char *argv[])
 {
-	debuglevel = 2;
+	debuglevel = 1;
 	load_config(0);
 	pthread_mutex_init(&flushlock, NULL);
 	int rval = pthread_create(&flushthread, NULL, flush_writes, NULL);
